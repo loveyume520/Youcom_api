@@ -1,4 +1,4 @@
-from flask import Flask, Response, request
+from flask import Flask, Response, request, jsonify
 import requests
 import uuid
 from datetime import datetime
@@ -287,5 +287,188 @@ def chatv1_1():
         print(e)
         return {"error": "Invalid JSON body"}, 404
 
+@app.route('/v1/models', methods=['GET']) 
+def models_v1():    
+    try:
+        models = ['gpt_4', 'gpt_4_turbo', 'claude_2', 'claude_3_opus', 'claude_3_sonnet', 'claude_3_haiku', 'gemini_pro', 'gemini_1_5_pro', 'databricks_dbrx_instruct', 'command_r', 'command_r_plus', 'zephyr', 'claude_3_opus_2k']
+        return {
+        "object": "list",
+        "data": [{
+            "id": m,
+            "object": "model",
+            "created": datetime.now().isoformat(),
+            "owned_by": "popai"
+        } for m in models]
+    }
+        # return jsonify(models)  
+    except Exception as e:
+        print('error')
+        print(e) 
+        return {"error": "Error retrieving models"}, 500
+
+@app.route('/v1/messages', methods=['POST'])
+def messages():
+    raw_body = request.get_data(as_text=True)
+    try:
+        json_body = json.loads(raw_body)
+        if json_body.get('stream') == False:
+            return jsonify({
+                'id': str(uuid.uuid4()),
+                'content': [
+                    {
+                        'text': 'Please turn on streaming.',
+                    },
+                    {
+                        'id': 'string',
+                        'name': 'string',
+                        'input': {},
+                    },
+                ],
+                'model': 'string',
+                'stop_reason': 'end_turn',
+                'stop_sequence': 'string',
+                'usage': {
+                    'input_tokens': 0,
+                    'output_tokens': 0,
+                },
+            })
+        elif json_body.get('stream') == True:
+            # 计算用户消息长度
+            user_message = [{'question': '', 'answer': ''}]
+            user_query = ''
+            last_update = True
+            if json_body.get('system'):
+                # 把系统消息加入messages的首条
+                json_body['messages'].insert(0, {'role': 'system', 'content': json_body['system']})
+            print(json_body['messages'])
+            for msg in json_body['messages']:
+                if msg['role'] == 'system' or msg['role'] == 'user':
+                    if last_update:
+                        user_message[-1]['question'] += msg['content'] + '\n'
+                    elif user_message[-1]['question'] == '':
+                        user_message[-1]['question'] += msg['content'] + '\n'
+                    else:
+                        user_message.append({'question': msg['content'] + '\n', 'answer': ''})
+                    last_update = True
+                elif msg['role'] == 'assistant':
+                    if not last_update:
+                        user_message[-1]['answer'] += msg['content'] + '\n'
+                    elif user_message[-1]['answer'] == '':
+                        user_message[-1]['answer'] += msg['content'] + '\n'
+                    else:
+                        user_message.append({'question': '', 'answer': msg['content'] + '\n'})
+                    last_update = False
+            user_query = user_message[-1]['question']
+
+            # 获取traceId
+            trace_id = str(uuid.uuid4())
+
+            # 试算用户消息长度
+            if len(json.dumps(user_message)) + len(user_query) > 32000:
+                # 太长了，需要上传
+                # user message to plaintext
+                previous_messages = '\n\n'.join([msg['content'] for msg in json_body['messages']])
+                user_query = 'Please view the document and reply.'
+                user_message = []
+
+                # GET https://you.com/api/get_nonce to get nonce
+                nonce_response = requests.get('https://you.com/api/get_nonce')
+                nonce = nonce_response.json()
+                if not nonce:
+                    raise Exception('Failed to get nonce')
+
+                # POST https://you.com/api/upload to upload user message
+                message_buffer = create_docx(previous_messages)
+                files = {'file': ('messages.docx', message_buffer, 'application/vnd.openxmlformats-officedocument.wordprocessingml.document')}
+                headers = {'X-Upload-Nonce': nonce}
+                upload_response = requests.post('https://you.com/api/upload', files=files, headers=headers)
+                uploaded_file = upload_response.json().get('filename')
+                if not uploaded_file:
+                    raise Exception('Failed to upload messages')
+
+            msg_id = str(uuid.uuid4())
+
+            # send message start
+            yield create_event('message_start', {
+                'type': 'message_start',
+                'message': {
+                    'id': trace_id,
+                    'type': 'message',
+                    'role': 'assistant',
+                    'content': [],
+                    'model': 'claude_3_haiku',
+                    'stop_reason': None,
+                    'stop_sequence': None,
+                    'usage': {'input_tokens': 8, 'output_tokens': 1},
+                },
+            })
+            yield create_event('content_block_start', {'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}})
+            yield create_event('ping', {'type': 'ping'})
+
+            # proxy response
+            params = {
+                'page': '1',
+                'count': '10',
+                'safeSearch': 'Off',
+                'q': user_query.strip(),
+                'incognito': 'true',
+                'chatId': trace_id,
+                'traceId': f'{trace_id}|{msg_id}|{datetime.utcnow().isoformat()}',
+                'conversationTurnId': msg_id,
+                'selectedAIModel': 'claude_3_opus',
+                'selectedChatMode': 'custom',
+                'pastChatLength': len(user_message),
+                'queryTraceId': trace_id,
+                'use_personalization_extraction': 'false',
+                'domain': 'youchat',
+                'responseFilter': 'WebPages,TimeZone,Computation,RelatedSearches',
+                'mkt': 'zh-CN',
+                'userFiles': json.dumps([{'user_filename': 'messages.docx', 'filename': uploaded_file, 'size': len(message_buffer)}]) if uploaded_file else '',
+                'chat': json.dumps(user_message),
+            }
+            headers = {
+                'accept': 'text/event-stream',
+                'referer': 'https://you.com/search?q=&fromSearchBar=true&tbm=youchat&chatMode=custom'
+            }
+            proxy_req = requests.get('https://you.com/api/streamingSearch', params=params, headers=headers, stream=True)
+
+            cached_line = ''
+            for chunk in proxy_req.iter_content(chunk_size=1, decode_unicode=True):
+                if cached_line:
+                    chunk = cached_line + chunk
+                    cached_line = ''
+
+                if not chunk.endswith('\n'):
+                    lines = chunk.split('\n')
+                    cached_line = lines.pop()
+                    chunk = '\n'.join(lines)
+
+                if 'event: youChatToken' in chunk:
+                    for line in chunk.split('\n'):
+                        if line.startswith('data: {"youChatToken"'):
+                            data = line[6:]
+                            json_data = json.loads(data)
+                            chunk_json = json.dumps({
+                                'type': 'content_block_delta',
+                                'index': 0,
+                                'delta': {'type': 'text_delta', 'text': json_data['youChatToken']},
+                            })
+                            yield create_event('content_block_delta', chunk_json)
+
+            # send ending
+            yield create_event('content_block_stop', {'type': 'content_block_stop', 'index': 0})
+            yield create_event('message_delta', {
+                'type': 'message_delta',
+                'delta': {'stop_reason': 'end_turn', 'stop_sequence': None},
+                'usage': {'output_tokens': 12},
+            })
+            yield create_event('message_stop', {'type': 'message_stop'})
+
+        else:
+            raise Exception('Invalid request')
+    except Exception as e:
+        print(e)
+        return jsonify({'error': str(e)}), 500
+
 if __name__ == '__main__':
-    app.run(debug=True, port=50600)
+    app.run(debug=True, port=50600,host='0.0.0.0')
